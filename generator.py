@@ -361,6 +361,7 @@ class DataGenerator:
             self._log_summary(world_time)
         except Exception as e:
             logger.error(f"Error in data generation: {e}", exc_info=True)
+            raise
         finally:
             self.sink.close()
 
