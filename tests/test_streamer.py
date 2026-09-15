@@ -90,9 +90,30 @@ def test_synchronous_backpressure_retries_the_same_batch(monkeypatch):
     monkeypatch.setattr(streamer, "StreamingIngestError", FakeIngestError)
     monkeypatch.setattr(streamer.time, "sleep", lambda seconds: None)
 
-    returned = streamer._append_with_backpressure_wait(
-        BackpressuredChannel(), rows, "batch-1"
-    )
+    channel = BackpressuredChannel()
+    sink = make_sink({"resort_tickets": channel})
+    sink.append_batches({"resort_tickets": rows})
 
-    assert returned is future
     assert calls == [rows, rows]
+
+
+def test_persistent_backpressure_times_out_and_raises(monkeypatch):
+    rows = [{"id": 1}]
+    calls = []
+
+    class Always429Channel:
+        def append_rows_with_wait(self, received_rows, token):
+            calls.append(received_rows)
+            raise FakeIngestError(429)
+
+    monkeypatch.setattr(streamer, "StreamingIngestError", FakeIngestError)
+    monkeypatch.setattr(streamer.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(streamer, "BACKPRESSURE_TIMEOUT_SECONDS", 0.0)
+
+    channel = Always429Channel()
+    sink = make_sink({"resort_tickets": channel})
+
+    with pytest.raises(RuntimeError, match="resort_tickets"):
+        sink.append_batches({"resort_tickets": rows})
+
+    assert len(calls) >= 1

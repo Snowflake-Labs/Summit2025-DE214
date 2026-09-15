@@ -12,7 +12,7 @@ logger = logging.getLogger("ski_data_streamer")
 
 load_dotenv()
 
-BACKPRESSURE_WAIT_SECONDS = 0.1
+BACKPRESSURE_TIMEOUT_SECONDS = 30.0
 
 
 def _required_env(name):
@@ -35,16 +35,6 @@ def _account_uri_parts():
     if account.endswith(".privatelink"):
         account = account[: -len(".privatelink")]
     return uri, account
-
-
-def _append_with_backpressure_wait(channel, rows, token):
-    while True:
-        try:
-            return channel.append_rows_with_wait(rows, token)
-        except StreamingIngestError as exc:
-            if exc.http_status_code != 429:
-                raise
-            time.sleep(BACKPRESSURE_WAIT_SECONDS)
 
 
 class SnowflakeStreamingSink:
@@ -96,15 +86,22 @@ class SnowflakeStreamingSink:
         for stream_name, rows in batches.items():
             if rows:
                 self._append_seq += 1
-                try:
-                    future = _append_with_backpressure_wait(
-                        self._channels[stream_name],
-                        rows,
-                        f"{stream_name}-{self._append_seq}",
-                    )
-                    pending.append((stream_name, len(rows), future))
-                except Exception as exc:
-                    pending.append((stream_name, len(rows), exc))
+                token = f"{stream_name}-{self._append_seq}"
+                channel = self._channels[stream_name]
+                deadline = time.monotonic() + BACKPRESSURE_TIMEOUT_SECONDS
+                while True:
+                    try:
+                        future = channel.append_rows_with_wait(rows, token)
+                        pending.append((stream_name, len(rows), future))
+                        break
+                    except StreamingIngestError as exc:
+                        if exc.http_status_code != 429 or time.monotonic() >= deadline:
+                            pending.append((stream_name, len(rows), exc))
+                            break
+                        time.sleep(0.1)
+                    except Exception as exc:
+                        pending.append((stream_name, len(rows), exc))
+                        break
 
         failures = []
         for stream_name, row_count, result in pending:
