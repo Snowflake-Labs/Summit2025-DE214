@@ -125,6 +125,8 @@ docker compose up
 The generator creates one `StreamingIngestClient` per pipe, gets each client's
 singleton elastic channel, and batches generated rows with `append_rows_with_wait`.
 The returned futures complete only after Snowflake durably acknowledges the rows.
+If a future fails after the SDK's internal retries, the generator waits for the other
+pipe futures, reports the failed pipe, and exits with an error.
 
 ## Create dynamic tables to prepare data for reporting
 

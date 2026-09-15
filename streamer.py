@@ -1,8 +1,9 @@
 import logging
 import os
+import time
 
 from dotenv import load_dotenv
-from snowflake.ingest.streaming import StreamingIngestClient
+from snowflake.ingest.streaming import StreamingIngestClient, StreamingIngestError
 
 from utils import configure_logging
 
@@ -11,7 +12,7 @@ logger = logging.getLogger("ski_data_streamer")
 
 load_dotenv()
 
-ACK_TIMEOUT_SECONDS = int(os.getenv("ACK_TIMEOUT_SECONDS", "120"))
+BACKPRESSURE_WAIT_SECONDS = 0.1
 
 
 def _required_env(name):
@@ -34,6 +35,16 @@ def _account_uri_parts():
     if account.endswith(".privatelink"):
         account = account[: -len(".privatelink")]
     return uri, account
+
+
+def _append_with_backpressure_wait(channel, rows, token):
+    while True:
+        try:
+            return channel.append_rows_with_wait(rows, token)
+        except StreamingIngestError as exc:
+            if exc.http_status_code != 429:
+                raise
+            time.sleep(BACKPRESSURE_WAIT_SECONDS)
 
 
 class SnowflakeStreamingSink:
@@ -80,23 +91,38 @@ class SnowflakeStreamingSink:
             raise
 
     def append_batches(self, batches):
-        """Append each non-empty batch and wait for Snowflake's durable ack."""
+        """Append each non-empty batch and wait for every durable acknowledgement."""
         pending = []
         for stream_name, rows in batches.items():
             if rows:
                 self._append_seq += 1
-                future = self._channels[stream_name].append_rows_with_wait(
-                    rows, f"{stream_name}-{self._append_seq}"
-                )
-                pending.append((stream_name, len(rows), future))
+                try:
+                    future = _append_with_backpressure_wait(
+                        self._channels[stream_name],
+                        rows,
+                        f"{stream_name}-{self._append_seq}",
+                    )
+                    pending.append((stream_name, len(rows), future))
+                except Exception as exc:
+                    pending.append((stream_name, len(rows), exc))
 
-        for stream_name, row_count, future in pending:
-            future.result(timeout=ACK_TIMEOUT_SECONDS)
-            logger.debug(
-                "Snowflake durably acknowledged %d %s rows",
-                row_count,
-                stream_name,
-            )
+        failures = []
+        for stream_name, row_count, result in pending:
+            try:
+                if isinstance(result, BaseException):
+                    raise result
+                result.result()
+                logger.debug(
+                    "Snowflake durably acknowledged %d %s rows",
+                    row_count,
+                    stream_name,
+                )
+            except Exception as exc:
+                failures.append((stream_name, exc))
+
+        if failures:
+            names = ", ".join(stream_name for stream_name, _ in failures)
+            raise RuntimeError(f"Snowflake failed to acknowledge: {names}") from failures[0][1]
 
     def close(self):
         for client in self._clients.values():
